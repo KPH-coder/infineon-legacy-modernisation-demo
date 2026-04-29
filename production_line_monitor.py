@@ -3,14 +3,17 @@
 # Real-time monitoring script for automated production line status
 # Aggregates machine state, error codes, and throughput from line PLCs
 # Author: plant-automation@infineon.internal | Created: 2010 | Python 2.7
+# Migrated to Python 3 — see inline comments marked [Py3 migration]
 
 import sys
 import time
-import thread
+# [Py3 migration] Removed 'import thread' (renamed to _thread in Py3).
+# Using threading.Thread instead of thread.start_new_thread — same behaviour,
+# and threading was already imported in the original code.
 import threading
-import Queue
+# [Py3 migration] Queue module → queue (lowercase) in Python 3
+import queue
 import socket
-import string
 import shelve
 
 PLC_HOST = "plc-controller-01.regensburg.infineon.corp"
@@ -28,8 +31,8 @@ STATE_CODES = {
     5: 'SHUTDOWN'
 }
 
-# Global event queue (Python 2 Queue module)
-event_queue = Queue.Queue()
+# [Py3 migration] Queue.Queue → queue.Queue
+event_queue = queue.Queue()
 stop_flag = threading.Event()
 
 
@@ -67,29 +70,35 @@ def poll_plc(host, port):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5)
         s.connect((host, port))
-        s.sendall("GET_STATE_ALL\r\n")
-        data = ""
+        # [Py3 migration] Sockets require bytes in Py3, not str
+        s.sendall(b"GET_STATE_ALL\r\n")
+        # [Py3 migration] Socket recv returns bytes in Py3; accumulate as bytes,
+        # then decode to str before text parsing
+        data = b""
         while True:
             chunk = s.recv(1024)
             if not chunk:
                 break
             data += chunk
         s.close()
-        return parse_plc_response(data)
+        return parse_plc_response(data.decode('ascii'))
     except socket.timeout:
         raise PLCConnectionError("Timeout connecting to PLC at %s:%d" % (host, port))
-    except socket.error, e:
+    # [Py3 migration] except Type, e → except Type as e
+    except socket.error as e:
         raise PLCConnectionError("Socket error: %s" % e)
 
 
 def parse_plc_response(raw):
     """Parse PLC ASCII response into MachineState objects."""
     machines = []
-    for line in string.split(raw, '\n'):
-        line = string.strip(line)
+    # [Py3 migration] string.split(s, sep) → s.split(sep); string.strip(s) → s.strip()
+    # Removed 'import string' — using str methods directly
+    for line in raw.split('\n'):
+        line = line.strip()
         if not line:
             continue
-        parts = string.split(line, '|')
+        parts = line.split('|')
         if len(parts) < 3:
             continue
         machine_id = parts[0]
@@ -99,22 +108,23 @@ def parse_plc_response(raw):
             error_code = parts[3] if len(parts) > 3 else None
             machines.append(MachineState(machine_id, state_code, throughput, error_code))
         except ValueError:
-            print "Bad data from PLC for machine: %s" % machine_id
+            print("Bad data from PLC for machine: %s" % machine_id)
     return machines
 
 
 def log_error(machine_state):
     """Write critical machine errors to the error log."""
     try:
-        f = open(ERROR_LOG, 'a')
-        f.write("%s | Machine %s | Error: %s\n" % (
-            time.strftime('%Y-%m-%d %H:%M:%S'),
-            machine_state.machine_id,
-            machine_state.error_code or 'UNSPECIFIED'
-        ))
-        f.close()
-    except IOError, e:
-        print "Cannot write to error log: %s" % e
+        # [Py3 migration] Added context manager for safe file handling
+        with open(ERROR_LOG, 'a') as f:
+            f.write("%s | Machine %s | Error: %s\n" % (
+                time.strftime('%Y-%m-%d %H:%M:%S'),
+                machine_state.machine_id,
+                machine_state.error_code or 'UNSPECIFIED'
+            ))
+    # [Py3 migration] except Type, e → except Type as e
+    except IOError as e:
+        print("Cannot write to error log: %s" % e)
 
 
 def monitoring_thread_func():
@@ -124,30 +134,34 @@ def monitoring_thread_func():
             states = poll_plc(PLC_HOST, PLC_PORT)
             for state in states:
                 event_queue.put(state)
-        except PLCConnectionError, e:
-            print "PLC polling failed: %s" % e
+        # [Py3 migration] except Type, e → except Type as e
+        except PLCConnectionError as e:
+            print("PLC polling failed: %s" % e)
         time.sleep(POLL_INTERVAL_SEC)
 
 
 def persist_state_snapshot(states, db_path):
-    """Persist current state snapshot using shelve (Python 2 style)."""
-    db = shelve.open(db_path)
-    for s in states:
-        db[str(s.machine_id)] = {
-            'state': s.state_name,
-            'throughput': s.throughput,
-            'timestamp': s.timestamp
-        }
-    db.close()
+    """Persist current state snapshot using shelve."""
+    # [Py3 migration] Added context manager for shelve (supported since Py 3.4)
+    with shelve.open(db_path) as db:
+        for s in states:
+            db[str(s.machine_id)] = {
+                'state': s.state_name,
+                'throughput': s.throughput,
+                'timestamp': s.timestamp
+            }
 
 
 def run_monitor():
     """Main monitoring loop."""
-    print "Starting Infineon Production Line Monitor..."
-    print "Connecting to PLC: %s:%d" % (PLC_HOST, PLC_PORT)
+    print("Starting Infineon Production Line Monitor...")
+    print("Connecting to PLC: %s:%d" % (PLC_HOST, PLC_PORT))
 
-    # Start background polling thread (Python 2 thread module)
-    thread.start_new_thread(monitoring_thread_func, ())
+    # [Py3 migration] Replaced thread.start_new_thread() with threading.Thread.
+    # daemon=True ensures the thread exits when the main thread exits, matching
+    # the original fire-and-forget behaviour of thread.start_new_thread().
+    monitor_thread = threading.Thread(target=monitoring_thread_func, daemon=True)
+    monitor_thread.start()
 
     critical_count = 0
 
@@ -155,17 +169,18 @@ def run_monitor():
         while True:
             try:
                 state = event_queue.get(timeout=POLL_INTERVAL_SEC + 2)
-                print str(state)
+                print(str(state))
                 if state.is_critical():
                     critical_count += 1
                     log_error(state)
                     if critical_count >= 3:
-                        print "*** ALERT: 3+ critical errors detected - notify line supervisor ***"
+                        print("*** ALERT: 3+ critical errors detected - notify line supervisor ***")
                         critical_count = 0
-            except Queue.Empty:
-                print "[%s] No data received from PLC" % time.strftime('%H:%M:%S')
+            # [Py3 migration] Queue.Empty → queue.Empty
+            except queue.Empty:
+                print("[%s] No data received from PLC" % time.strftime('%H:%M:%S'))
     except KeyboardInterrupt:
-        print "\nShutting down monitor..."
+        print("\nShutting down monitor...")
         stop_flag.set()
         sys.exit(0)
 
